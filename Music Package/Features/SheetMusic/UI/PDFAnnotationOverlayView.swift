@@ -163,7 +163,7 @@ final class PDFAnnotationOverlayView: UIView {
 
         let ann = PDFAnnotation(bounds: bounds, forType: .ink, withProperties: nil)
         ann.add(inkPath)
-
+        
         switch tool {
         case .pen:
             ann.color = strokeColor // full opacity

@@ -1,38 +1,36 @@
 import UIKit
 import PDFKit
-import ARKit
-import simd
 
-final class PDFViewerViewController: UIViewController, ARSessionDelegate, UIGestureRecognizerDelegate {
+final class PDFViewerViewController: UIViewController, UIGestureRecognizerDelegate {
 
     private let pdfURL: URL
     private let pdfView = PDFView(frame: .zero)
-    
+
+    // Annotation engine (your existing overlay)
     private let annotationOverlay = PDFAnnotationOverlayView()
-    private let annotationToolbar = PDFAnnotationToolbarView()
+
+    // Floating Notability-like toolbar
+    private let floatingToolbar = NotabilityToolbarView()
+
+    // Floating back chevron (blurred pill)
+    private let backButtonBlur = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterialDark))
+    private let backButton = UIButton(type: .system)
+
+    // ✅ Tap recognizer should be on the top-level view (not PDFView),
+    // because PDFKit can swallow taps when it's handling selection/scroll.
+    private lazy var chromeTapRecognizer: UITapGestureRecognizer = {
+        let gr = UITapGestureRecognizer(target: self, action: #selector(handleTapZones(_:)))
+        gr.delegate = self
+        gr.cancelsTouchesInView = false
+        return gr
+    }()
+
+    // Saving
     private var annotationsDirty = false
 
-    private let arSession = ARSession()
-    private let detector = GestureDetector()
-    private var pageTurnSettings = PageTurnSettingsStore.shared.load()
-
-    // MARK: - Page turn gating
-    private var wasSelectedGestureActive = false
-    private var lastPageTurnTime: TimeInterval = 0
-    private let pageTurnCooldown: TimeInterval = 0.8
-
-    // MARK: - Tilt baseline calibration
-    private var rollBaseline: Float? = nil
-    private var rollBaselineSum: Float = 0
-    private var rollBaselineCount: Int = 0
-    private let rollBaselineSamplesNeeded: Int = 30
-
-    // MARK: - Performance mode
-    private var chromeTimer: Timer?
+    // Chrome (auto-hide)
     private var chromeHidden = false
-    
-
-
+    private var chromeTimer: Timer?
 
     init(pdfURL: URL) {
         self.pdfURL = pdfURL
@@ -41,35 +39,13 @@ final class PDFViewerViewController: UIViewController, ARSessionDelegate, UIGest
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    
-    private func applyZoomLimits() {
-        // This is the “fit to screen” scale for the current bounds
-        let fit = pdfView.scaleFactorForSizeToFit
-
-        // Prevent zooming out smaller than “fit”
-        pdfView.minScaleFactor = fit
-
-        // Reasonable zoom-in limit (tweak as you like)
-        pdfView.maxScaleFactor = max(fit * 4.0, 4.0)
-
-        // Clamp current scale if already below fit
-        if pdfView.scaleFactor < fit {
-            pdfView.scaleFactor = fit
-        }
-    }
-
-    
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        applyZoomLimits()
-    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
-        view.tintColor = MPStyle.accentColor
+        view.tintColor = .systemBlue
 
-        // PDF setup: left/right swiping
+        // PDF setup
         pdfView.translatesAutoresizingMaskIntoConstraints = false
         pdfView.autoScales = true
         pdfView.displayMode = .singlePage
@@ -80,17 +56,22 @@ final class PDFViewerViewController: UIViewController, ARSessionDelegate, UIGest
         view.addSubview(pdfView)
 
         NSLayoutConstraint.activate([
-            pdfView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            pdfView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor),
-            pdfView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor),
+            pdfView.topAnchor.constraint(equalTo: view.topAnchor),
+            pdfView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            pdfView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             pdfView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
-        
-        // --- Annotation overlay (draw on top of PDF) ---
+
+        // ✅ Add tap recognizer to the controller's root view (reliable)
+        view.addGestureRecognizer(chromeTapRecognizer)
+
+        // Annotation overlay on top
         annotationOverlay.translatesAutoresizingMaskIntoConstraints = false
         annotationOverlay.pdfView = pdfView
-        annotationOverlay.isUserInteractionEnabled = true
-        annotationOverlay.tool = .none
+        annotationOverlay.tool = .pen
+        annotationOverlay.pencilOnly = true
+        annotationOverlay.strokeColor = .systemBlue
+        annotationOverlay.strokeWidth = 2.5
         annotationOverlay.updatePreviewStyle()
         view.addSubview(annotationOverlay)
 
@@ -101,137 +82,203 @@ final class PDFViewerViewController: UIViewController, ARSessionDelegate, UIGest
             annotationOverlay.bottomAnchor.constraint(equalTo: pdfView.bottomAnchor)
         ])
 
-        // --- Annotation toolbar (hidden by default) ---
-        annotationToolbar.translatesAutoresizingMaskIntoConstraints = false
-        annotationToolbar.alpha = 0
-        annotationToolbar.isHidden = true
-        view.addSubview(annotationToolbar)
+        // Floating toolbar (Notability style)
+        floatingToolbar.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(floatingToolbar)
 
         NSLayoutConstraint.activate([
-            annotationToolbar.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
-            annotationToolbar.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
-            annotationToolbar.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12)
+            floatingToolbar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
+            floatingToolbar.centerXAnchor.constraint(equalTo: view.centerXAnchor)
         ])
 
-        annotationToolbar.onChange = { [weak self] st in
+        floatingToolbar.onChange = { [weak self] st in
             guard let self else { return }
-            self.annotationOverlay.tool = st.tool
-            self.annotationOverlay.strokeColor = st.color
-            self.annotationOverlay.strokeWidth = st.width
-            self.annotationOverlay.pencilOnly = st.pencilOnly
+
+            switch st.tool {
+            case .pen:
+                self.annotationOverlay.tool = .pen
+                self.annotationOverlay.strokeColor = st.color
+                self.annotationOverlay.strokeWidth = st.thickness
+            case .highlighter:
+                self.annotationOverlay.tool = .highlighter
+                self.annotationOverlay.strokeColor = st.color
+                self.annotationOverlay.strokeWidth = max(st.thickness, 6)
+            case .eraser:
+                self.annotationOverlay.tool = .eraser
+            }
             self.annotationOverlay.updatePreviewStyle()
         }
 
-
-        // Only keep a settings button in the nav bar (tap zones handle paging)
-        let settings = UIBarButtonItem(
-            image: UIImage(systemName: "slider.horizontal.3"),
-            style: .plain,
-            target: self,
-            action: #selector(openSettings)
-        )
-        navigationItem.rightBarButtonItem = settings
-        
-        let annotate = UIBarButtonItem(
-            image: UIImage(systemName: "pencil.tip"),
-            style: .plain,
-            target: self,
-            action: #selector(toggleAnnotateUI)
-        )
-        navigationItem.leftBarButtonItem = annotate
-
-
-        // Tap zones: single tap on PDF view
-        let tap = UITapGestureRecognizer(target: self, action: #selector(handleTapZones(_:)))
-        tap.delegate = self
-        tap.cancelsTouchesInView = false // don’t kill PDFKit interactions
-        pdfView.addGestureRecognizer(tap)
+        // Floating back button (aligned to toolbar height)
+        configureFloatingBackButton()
 
         loadPDF()
 
-        // AR session delegate
-        arSession.delegate = self
-
-        NotificationCenter.default.addObserver(self, selector: #selector(handleTiltRecalibrationRequest),
-                                               name: .requestTiltRecalibration, object: nil)
-        
         NotificationCenter.default.addObserver(self, selector: #selector(markAnnotationsDirty),
                                                name: .pdfDidChangeAnnotations, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(appWillResignActive),
+                                               name: UIApplication.willResignActiveNotification, object: nil)
 
+        // Start with chrome visible, then auto-hide shortly after opening
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.scheduleChromeHideIfNeeded()
+        }
     }
 
-    override func viewWillAppear(_ animated: Bool) {
-        super.viewWillAppear(animated)
-
-        applyPerformanceModeUI(animated: false)
-        startFaceTrackingIfAvailable()
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        applyZoomLimits()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-
         saveAnnotationsIfNeeded()
-
         chromeTimer?.invalidate()
         chromeTimer = nil
-
-        UIApplication.shared.isIdleTimerDisabled = false
-        navigationController?.setNavigationBarHidden(false, animated: false)
-
-        arSession.pause()
-    }
-
-
-    deinit {
         NotificationCenter.default.removeObserver(self)
     }
 
-    override var prefersStatusBarHidden: Bool {
-        // If you want status bar hidden in performance mode when chrome is hidden:
-        pageTurnSettings.performanceMode && chromeHidden
+    // MARK: - Back button micro-polish
+
+    @objc private func backButtonDown() {
+        UIView.animate(withDuration: 0.1) {
+            self.backButtonBlur.transform = CGAffineTransform(scaleX: 0.94, y: 0.94)
+        }
     }
 
-    private func loadPDF() {
-        guard let doc = PDFDocument(url: pdfURL) else {
-            let alert = UIAlertController(title: "Couldn't open PDF",
-                                          message: "The file may be corrupted.",
-                                          preferredStyle: .alert)
-            alert.addAction(UIAlertAction(title: "OK", style: .default))
-            present(alert, animated: true)
-            return
+    @objc private func backButtonUp() {
+        UIView.animate(withDuration: 0.1) {
+            self.backButtonBlur.transform = .identity
         }
+    }
+
+    private func configureFloatingBackButton() {
+        backButtonBlur.translatesAutoresizingMaskIntoConstraints = false
+        backButtonBlur.layer.cornerRadius = 20
+        backButtonBlur.clipsToBounds = true
+
+        // Shadow (matches toolbar)
+        backButtonBlur.layer.shadowColor = UIColor.black.cgColor
+        backButtonBlur.layer.shadowOpacity = 0.35
+        backButtonBlur.layer.shadowRadius = 18
+        backButtonBlur.layer.shadowOffset = CGSize(width: 0, height: 10)
+        backButtonBlur.layer.masksToBounds = false
+
+        view.addSubview(backButtonBlur)
+
+        NSLayoutConstraint.activate([
+            backButtonBlur.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 14),
+            backButtonBlur.centerYAnchor.constraint(equalTo: floatingToolbar.centerYAnchor),
+            backButtonBlur.widthAnchor.constraint(equalToConstant: 40),
+            backButtonBlur.heightAnchor.constraint(equalToConstant: 40)
+        ])
+
+        // Chevron button inside blur
+        backButton.translatesAutoresizingMaskIntoConstraints = false
+        backButton.setImage(UIImage(systemName: "chevron.left"), for: .normal)
+        backButton.tintColor = .white
+        backButton.addTarget(self, action: #selector(dismissToLibrary), for: .touchUpInside)
+
+        // Micro-polish (press animation)
+        backButton.addTarget(self, action: #selector(backButtonDown), for: .touchDown)
+        backButton.addTarget(self, action: #selector(backButtonUp),
+                             for: [.touchUpInside, .touchCancel, .touchUpOutside])
+
+        backButtonBlur.contentView.addSubview(backButton)
+
+        NSLayoutConstraint.activate([
+            backButton.centerXAnchor.constraint(equalTo: backButtonBlur.contentView.centerXAnchor),
+            backButton.centerYAnchor.constraint(equalTo: backButtonBlur.contentView.centerYAnchor)
+        ])
+    }
+
+    @objc private func dismissToLibrary() {
+        saveAnnotationsIfNeeded()
+        dismiss(animated: true)
+    }
+
+    // MARK: - PDF
+
+    private func loadPDF() {
+        guard let doc = PDFDocument(url: pdfURL) else { return }
         pdfView.document = doc
         pdfView.goToFirstPage(nil)
-        
         applyZoomLimits()
     }
 
-    private func startFaceTrackingIfAvailable() {
-        guard ARFaceTrackingConfiguration.isSupported else { return }
-
-        // Reset gating + calibration when we (re)start
-        wasSelectedGestureActive = false
-        lastPageTurnTime = 0
-        resetTiltBaseline()
-
-        let config = ARFaceTrackingConfiguration()
-        config.isLightEstimationEnabled = true
-        arSession.run(config, options: [.resetTracking, .removeExistingAnchors])
+    // Prevent infinite zoom-out: min zoom = fit-to-screen
+    private func applyZoomLimits() {
+        let fit = pdfView.scaleFactorForSizeToFit
+        pdfView.minScaleFactor = fit
+        pdfView.maxScaleFactor = max(fit * 4.0, 4.0)
+        if pdfView.scaleFactor < fit { pdfView.scaleFactor = fit }
     }
 
-    private func applyPerformanceModeUI(animated: Bool) {
-        UIApplication.shared.isIdleTimerDisabled = pageTurnSettings.performanceMode
+    // MARK: - Tap zones + Chrome reveal
 
-        if pageTurnSettings.performanceMode {
-            scheduleChromeHide()
+    @objc private func handleTapZones(_ gr: UITapGestureRecognizer) {
+        let p = gr.location(in: view) // ✅ use root view coordinates
+        let w = view.bounds.width
+        let h = view.bounds.height
+        guard w > 0, h > 0 else { return }
+
+        // Any interaction counts as activity
+        // (so if chrome is already visible, it stays up a bit longer)
+        if !chromeHidden {
+            scheduleChromeHideIfNeeded()
+        }
+
+        // 🔝 Top reveal zone (tap near top to show controls)
+        let topRevealHeight = h * 0.22
+        if p.y < topRevealHeight {
+            setChromeHidden(false, animated: true)
+            scheduleChromeHideIfNeeded()
+            return
+        }
+
+        // Page turn zones (only apply if tap is within the PDF view area)
+        // Translate tap point into pdfView space
+        let pInPDF = gr.location(in: pdfView)
+        let pdfW = pdfView.bounds.width
+        let pdfH = pdfView.bounds.height
+        guard pdfW > 0, pdfH > 0 else { return }
+
+        let left = pdfW / 3.0
+        let right = 2.0 * pdfW / 3.0
+
+        if pInPDF.x < left {
+            pdfView.goToPreviousPage(nil)
+            scheduleChromeHideIfNeeded()
+        } else if pInPDF.x > right {
+            pdfView.goToNextPage(nil)
+            scheduleChromeHideIfNeeded()
         } else {
-            chromeHidden = false
-            navigationController?.setNavigationBarHidden(false, animated: animated)
-            setNeedsStatusBarAppearanceUpdate()
+            toggleChrome()
         }
     }
 
-    private func scheduleChromeHide() {
+    // ✅ Make our tap recognizer work alongside PDFKit’s internal recognizers
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        true
+    }
+
+    // ✅ Give our tap priority when PDFKit has competing taps
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRequireFailureOf otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        // If PDFKit has internal tap recognizers, we still want ours to fire.
+        // Returning false means we don't require others to fail.
+        return false
+    }
+
+    // MARK: - Chrome auto-hide
+
+    private func toggleChrome() {
+        setChromeHidden(!chromeHidden, animated: true)
+        if !chromeHidden { scheduleChromeHideIfNeeded() }
+    }
+
+    private func scheduleChromeHideIfNeeded() {
         chromeTimer?.invalidate()
         chromeTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in
             self?.setChromeHidden(true, animated: true)
@@ -240,228 +287,34 @@ final class PDFViewerViewController: UIViewController, ARSessionDelegate, UIGest
 
     private func setChromeHidden(_ hidden: Bool, animated: Bool) {
         chromeHidden = hidden
-        navigationController?.setNavigationBarHidden(hidden, animated: animated)
-        setNeedsStatusBarAppearanceUpdate()
-    }
-
-    // MARK: - Tap zones + chrome toggle
-
-    @objc private func handleTapZones(_ gr: UITapGestureRecognizer) {
-        let point = gr.location(in: pdfView)
-        let w = pdfView.bounds.width
-        guard w > 0 else { return }
-
-        let x = point.x
-        let leftEdge = w / 3.0
-        let rightEdge = 2.0 * w / 3.0
-
-        if x < leftEdge {
-            // Left third: prev
-            prevPage()
-            if pageTurnSettings.performanceMode { scheduleChromeHide() }
-        } else if x > rightEdge {
-            // Right third: next
-            nextPage()
-            if pageTurnSettings.performanceMode { scheduleChromeHide() }
+        let apply = {
+            self.navigationController?.setNavigationBarHidden(true, animated: false) // keep real nav hidden
+            self.floatingToolbar.alpha = hidden ? 0 : 1
+            self.backButtonBlur.alpha = hidden ? 0 : 1
+        }
+        if animated {
+            UIView.animate(withDuration: 0.2, animations: apply)
         } else {
-            // Middle third: toggle controls (performance mode)
-            guard pageTurnSettings.performanceMode else { return }
-            setChromeHidden(!chromeHidden, animated: true)
-            if !chromeHidden { scheduleChromeHide() }
+            apply()
         }
     }
 
-    // Allow simultaneous recognition so PDFKit scroll/zoom isn’t broken.
-    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-        true
-    }
-
-    private func prevPage() { pdfView.goToPreviousPage(nil) }
-    private func nextPage() { pdfView.goToNextPage(nil) }
-
-    // MARK: - Settings sheet
-
-    @objc private func openSettings() {
-        let sheet = PageTurnSettingsSheetViewController(settings: pageTurnSettings) { [weak self] newSettings in
-            guard let self else { return }
-
-            self.pageTurnSettings = newSettings
-            PageTurnSettingsStore.shared.save(newSettings)
-
-            // Reset gating so we don't instantly trigger on a held gesture
-            self.wasSelectedGestureActive = false
-            self.lastPageTurnTime = 0
-
-            // Apply performance mode immediately
-            self.applyPerformanceModeUI(animated: true)
-
-            // If tilt is selected, recalibrate after closing
-            if newSettings.gesture.isTilt {
-                NotificationCenter.default.post(name: .requestTiltRecalibration, object: nil)
-            }
-        }
-
-        let nav = UINavigationController(rootViewController: sheet)
-        nav.view.tintColor = MPStyle.accentColor
-        present(nav, animated: true)
-    }
-
-    @objc private func handleTiltRecalibrationRequest() {
-        resetTiltBaseline()
-    }
-
-    private func resetTiltBaseline() {
-        rollBaseline = nil
-        rollBaselineSum = 0
-        rollBaselineCount = 0
-    }
-
-    // MARK: - ARSessionDelegate
-
-    func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
-        guard let faceAnchor = anchors.compactMap({ $0 as? ARFaceAnchor }).first else { return }
-
-        let b = faceAnchor.blendShapes
-
-        let rawRoll = computeFaceRollRelativeToScreen(faceAnchor: faceAnchor, in: session)
-        let roll = calibratedRoll(fromRaw: rawRoll)
-
-        let input = BlendInput(
-            jawOpen: b[.jawOpen]?.floatValue ?? 0,
-            eyeBlinkLeft: b[.eyeBlinkLeft]?.floatValue ?? 0,
-            eyeBlinkRight: b[.eyeBlinkRight]?.floatValue ?? 0,
-            mouthSmileL: b[.mouthSmileLeft]?.floatValue ?? 0,
-            mouthSmileR: b[.mouthSmileRight]?.floatValue ?? 0,
-            browInnerUp: b[.browInnerUp]?.floatValue ?? 0,
-            cheekPuff: b[.cheekPuff]?.floatValue ?? 0,
-            tongueOut: b[.tongueOut]?.floatValue ?? 0,
-            headRoll: roll
-        )
-
-        _ = detector.update(with: input, confidence: pageTurnSettings.confidence)
-
-        let selected = pageTurnSettings.gesture
-        let isActive = detector.isActive(selected)
-
-        let now = CACurrentMediaTime()
-        let cooledDown = (now - lastPageTurnTime) >= pageTurnCooldown
-        
-        if annotationOverlay.tool != .none { return }
-
-        if isActive && !wasSelectedGestureActive && cooledDown {
-            lastPageTurnTime = now
-            DispatchQueue.main.async { [weak self] in
-                self?.performPageTurn(for: selected)
-                if self?.pageTurnSettings.performanceMode == true {
-                    self?.scheduleChromeHide()
-                }
-            }
-        }
-
-        wasSelectedGestureActive = isActive
-    }
-
-    private func performPageTurn(for gesture: PageTurnGesture) {
-        switch gesture {
-        case .headTiltLeft:
-            prevPage()
-        case .headTiltRight:
-            nextPage()
-        default:
-            nextPage()
-        }
-    }
-
-    // MARK: - Roll + baseline
-
-    private func calibratedRoll(fromRaw raw: Float) -> Float {
-        if let baseline = rollBaseline {
-            return normalizeRadians(raw - baseline)
-        }
-
-        rollBaselineSum += raw
-        rollBaselineCount += 1
-        if rollBaselineCount >= rollBaselineSamplesNeeded {
-            rollBaseline = rollBaselineSum / Float(rollBaselineCount)
-        }
-        return 0
-    }
-
-    private func normalizeRadians(_ a: Float) -> Float {
-        var x = a
-        while x > .pi { x -= 2 * .pi }
-        while x < -.pi { x += 2 * .pi }
-        return x
-    }
-
-    private func computeFaceRollRelativeToScreen(faceAnchor: ARFaceAnchor, in session: ARSession) -> Float {
-        guard let frame = session.currentFrame else { return 0 }
-
-        let faceInCamera = simd_mul(simd_inverse(frame.camera.transform), faceAnchor.transform)
-
-        // Face "up" axis in camera coordinates (local +Y)
-        let cols = faceInCamera.columns
-        let faceUp = simd_normalize(simd_float3(cols.1.x, cols.1.y, cols.1.z))
-
-        let orientation = view.window?.windowScene?.interfaceOrientation ?? .portrait
-
-        let screenUp: simd_float3
-        let screenRight: simd_float3
-
-        switch orientation {
-        case .portrait:
-            screenUp = simd_float3(0, 1, 0)
-            screenRight = simd_float3(1, 0, 0)
-        case .portraitUpsideDown:
-            screenUp = simd_float3(0, -1, 0)
-            screenRight = simd_float3(-1, 0, 0)
-        case .landscapeLeft:
-            screenUp = simd_float3(1, 0, 0)
-            screenRight = simd_float3(0, -1, 0)
-        case .landscapeRight:
-            screenUp = simd_float3(-1, 0, 0)
-            screenRight = simd_float3(0, 1, 0)
-        default:
-            screenUp = simd_float3(0, 1, 0)
-            screenRight = simd_float3(1, 0, 0)
-        }
-
-        let u = screenUp
-        let v = screenRight
-        let projected = simd_normalize(u * simd_dot(faceUp, u) + v * simd_dot(faceUp, v))
-
-        return atan2(simd_dot(projected, v), simd_dot(projected, u))
-    }
-    
-    @objc private func toggleAnnotateUI() {
-        let show = annotationToolbar.isHidden
-        if show {
-            annotationToolbar.isHidden = false
-            UIView.animate(withDuration: 0.18) { self.annotationToolbar.alpha = 1 }
-        } else {
-            UIView.animate(withDuration: 0.18, animations: { self.annotationToolbar.alpha = 0 }) { _ in
-                self.annotationToolbar.isHidden = true
-                self.annotationOverlay.tool = .none
-                self.annotationOverlay.updatePreviewStyle()
-            }
-        }
-    }
+    // MARK: - Save annotations
 
     @objc private func markAnnotationsDirty() {
         annotationsDirty = true
-    }
-
-    private func saveAnnotationsIfNeeded() {
-        guard annotationsDirty else { return }
-        guard let doc = pdfView.document else { return }
-
-        let ok = doc.write(to: pdfURL)
-        if ok { annotationsDirty = false }
     }
 
     @objc private func appWillResignActive() {
         saveAnnotationsIfNeeded()
     }
 
+    private func saveAnnotationsIfNeeded() {
+        guard annotationsDirty else { return }
+        guard let doc = pdfView.document else { return }
+        if doc.write(to: pdfURL) {
+            annotationsDirty = false
+        }
+    }
 }
 
