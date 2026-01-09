@@ -6,24 +6,50 @@ final class PDFViewerViewController: UIViewController, UIGestureRecognizerDelega
     private let pdfURL: URL
     private let pdfView = PDFView(frame: .zero)
 
-    // Annotation engine (your existing overlay)
+    // Annotation engine
     private let annotationOverlay = PDFAnnotationOverlayView()
 
-    // Floating Notability-like toolbar
+    // Floating toolbar
     private let floatingToolbar = NotabilityToolbarView()
 
     // Floating back chevron (blurred pill)
     private let backButtonBlur = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterialDark))
     private let backButton = UIButton(type: .system)
 
-    // ✅ Tap recognizer should be on the top-level view (not PDFView),
-    // because PDFKit can swallow taps when it's handling selection/scroll.
+    // Floating hamburger (blurred pill)
+    private let menuButtonBlur = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterialDark))
+    private let menuButton = UIButton(type: .system)
+
+    // Settings overlay
+    private let settingsOverlay = UIView()
+    private let settingsCardBlur = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterialDark))
+    private let gesturePicker = UIPickerView()
+    private let confidenceSlider = UISlider()
+    private let confidenceValueLabel = UILabel()
+    private let calibrateButton = UIButton(type: .system)
+    private let doneButton = UIButton(type: .system)
+
+    // ✅ We'll keep a reference so we can filter taps (outside only)
+    private lazy var overlayDismissTap: UITapGestureRecognizer = {
+        let gr = UITapGestureRecognizer(target: self, action: #selector(closeSettings))
+        gr.cancelsTouchesInView = false
+        gr.delegate = self
+        return gr
+    }()
+
+    // Tap recognizer on root view (reliable)
     private lazy var chromeTapRecognizer: UITapGestureRecognizer = {
         let gr = UITapGestureRecognizer(target: self, action: #selector(handleTapZones(_:)))
         gr.delegate = self
         gr.cancelsTouchesInView = false
         return gr
     }()
+
+    // Your existing gesture detector
+    private let detector = GestureDetector()
+
+    // ARKit driver that produces BlendInput for detector
+    private let faceDriver = FaceTrackingDriver()
 
     // Saving
     private var annotationsDirty = false
@@ -32,6 +58,11 @@ final class PDFViewerViewController: UIViewController, UIGestureRecognizerDelega
     private var chromeHidden = false
     private var chromeTimer: Timer?
 
+    // Gesture turning controls
+    private var lastTurnTime: CFTimeInterval = 0
+    private let turnCooldown: CFTimeInterval = 0.75
+    private var wasGestureActiveLastFrame = false
+
     init(pdfURL: URL) {
         self.pdfURL = pdfURL
         super.init(nibName: nil, bundle: nil)
@@ -39,6 +70,40 @@ final class PDFViewerViewController: UIViewController, UIGestureRecognizerDelega
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    // MARK: - Settings storage
+
+    private var selectedGesture: PageTurnGesture {
+        get {
+            if let raw = UserDefaults.standard.string(forKey: "PageTurnSelectedGesture"),
+               let g = PageTurnGesture(rawValue: raw) {
+                return g
+            }
+            return .blink
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: "PageTurnSelectedGesture")
+            updateCalibrateButtonVisibility()
+        }
+    }
+
+    private var confidence: Int {
+        get {
+            let v = UserDefaults.standard.integer(forKey: "PageTurnConfidence")
+            return v == 0 ? 70 : max(0, min(100, v))
+        }
+        set {
+            UserDefaults.standard.set(max(0, min(100, newValue)), forKey: "PageTurnConfidence")
+        }
+    }
+
+    private func recalibrateTiltIfNeeded() {
+        if selectedGesture.isTilt {
+            faceDriver.calibrateRollBaseline()
+        }
+    }
+
+    // MARK: - Lifecycle
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -62,7 +127,7 @@ final class PDFViewerViewController: UIViewController, UIGestureRecognizerDelega
             pdfView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
 
-        // ✅ Add tap recognizer to the controller's root view (reliable)
+        // Tap handler (top reveal chrome + page zones)
         view.addGestureRecognizer(chromeTapRecognizer)
 
         // Annotation overlay on top
@@ -82,7 +147,7 @@ final class PDFViewerViewController: UIViewController, UIGestureRecognizerDelega
             annotationOverlay.bottomAnchor.constraint(equalTo: pdfView.bottomAnchor)
         ])
 
-        // Floating toolbar (Notability style)
+        // Floating toolbar
         floatingToolbar.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(floatingToolbar)
 
@@ -93,7 +158,6 @@ final class PDFViewerViewController: UIViewController, UIGestureRecognizerDelega
 
         floatingToolbar.onChange = { [weak self] st in
             guard let self else { return }
-
             switch st.tool {
             case .pen:
                 self.annotationOverlay.tool = .pen
@@ -109,8 +173,9 @@ final class PDFViewerViewController: UIViewController, UIGestureRecognizerDelega
             self.annotationOverlay.updatePreviewStyle()
         }
 
-        // Floating back button (aligned to toolbar height)
         configureFloatingBackButton()
+        configureFloatingMenuButton()
+        configureSettingsOverlay()
 
         loadPDF()
 
@@ -119,10 +184,20 @@ final class PDFViewerViewController: UIViewController, UIGestureRecognizerDelega
         NotificationCenter.default.addObserver(self, selector: #selector(appWillResignActive),
                                                name: UIApplication.willResignActiveNotification, object: nil)
 
-        // Start with chrome visible, then auto-hide shortly after opening
+        // AR inputs -> GestureDetector -> page turns
+        faceDriver.onInput = { [weak self] input in
+            self?.processFaceInput(input)
+        }
+
+        // Start visible, then hide
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             self?.scheduleChromeHideIfNeeded()
         }
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        faceDriver.start()
     }
 
     override func viewDidLayoutSubviews() {
@@ -132,38 +207,62 @@ final class PDFViewerViewController: UIViewController, UIGestureRecognizerDelega
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        faceDriver.stop()
         saveAnnotationsIfNeeded()
         chromeTimer?.invalidate()
         chromeTimer = nil
         NotificationCenter.default.removeObserver(self)
     }
 
-    // MARK: - Back button micro-polish
+    // MARK: - Face input processing
 
-    @objc private func backButtonDown() {
-        UIView.animate(withDuration: 0.1) {
-            self.backButtonBlur.transform = CGAffineTransform(scaleX: 0.94, y: 0.94)
+    private func processFaceInput(_ input: BlendInput) {
+        // If the settings overlay is open, don't flip pages.
+        if !settingsOverlay.isHidden { return }
+
+        _ = detector.update(with: input, confidence: confidence)
+
+        let g = selectedGesture
+        let isActiveNow = detector.isActive(g)
+
+        // Edge-trigger so holding gesture doesn't spam flips
+        let justActivated = isActiveNow && !wasGestureActiveLastFrame
+        wasGestureActiveLastFrame = isActiveNow
+        guard justActivated else { return }
+
+        let now = CACurrentMediaTime()
+        guard now - lastTurnTime > turnCooldown else { return }
+        lastTurnTime = now
+
+        DispatchQueue.main.async { [weak self] in
+            self?.performPageTurn(for: g)
         }
     }
 
+    private func performPageTurn(for g: PageTurnGesture) {
+        pdfView.goToNextPage(nil)
+        scheduleChromeHideIfNeeded()
+    }
+
+    // MARK: - Back button (blur pill + micro-polish)
+
+    @objc private func backButtonDown() {
+        UIView.animate(withDuration: 0.1) { self.backButtonBlur.transform = CGAffineTransform(scaleX: 0.94, y: 0.94) }
+    }
+
     @objc private func backButtonUp() {
-        UIView.animate(withDuration: 0.1) {
-            self.backButtonBlur.transform = .identity
-        }
+        UIView.animate(withDuration: 0.1) { self.backButtonBlur.transform = .identity }
     }
 
     private func configureFloatingBackButton() {
         backButtonBlur.translatesAutoresizingMaskIntoConstraints = false
         backButtonBlur.layer.cornerRadius = 20
         backButtonBlur.clipsToBounds = true
-
-        // Shadow (matches toolbar)
         backButtonBlur.layer.shadowColor = UIColor.black.cgColor
         backButtonBlur.layer.shadowOpacity = 0.35
         backButtonBlur.layer.shadowRadius = 18
         backButtonBlur.layer.shadowOffset = CGSize(width: 0, height: 10)
         backButtonBlur.layer.masksToBounds = false
-
         view.addSubview(backButtonBlur)
 
         NSLayoutConstraint.activate([
@@ -173,17 +272,12 @@ final class PDFViewerViewController: UIViewController, UIGestureRecognizerDelega
             backButtonBlur.heightAnchor.constraint(equalToConstant: 40)
         ])
 
-        // Chevron button inside blur
         backButton.translatesAutoresizingMaskIntoConstraints = false
         backButton.setImage(UIImage(systemName: "chevron.left"), for: .normal)
         backButton.tintColor = .white
         backButton.addTarget(self, action: #selector(dismissToLibrary), for: .touchUpInside)
-
-        // Micro-polish (press animation)
         backButton.addTarget(self, action: #selector(backButtonDown), for: .touchDown)
-        backButton.addTarget(self, action: #selector(backButtonUp),
-                             for: [.touchUpInside, .touchCancel, .touchUpOutside])
-
+        backButton.addTarget(self, action: #selector(backButtonUp), for: [.touchUpInside, .touchCancel, .touchUpOutside])
         backButtonBlur.contentView.addSubview(backButton)
 
         NSLayoutConstraint.activate([
@@ -197,6 +291,227 @@ final class PDFViewerViewController: UIViewController, UIGestureRecognizerDelega
         dismiss(animated: true)
     }
 
+    // MARK: - Menu button (blur pill)
+
+    private func configureFloatingMenuButton() {
+        menuButtonBlur.translatesAutoresizingMaskIntoConstraints = false
+        menuButtonBlur.layer.cornerRadius = 20
+        menuButtonBlur.clipsToBounds = true
+        menuButtonBlur.layer.shadowColor = UIColor.black.cgColor
+        menuButtonBlur.layer.shadowOpacity = 0.35
+        menuButtonBlur.layer.shadowRadius = 18
+        menuButtonBlur.layer.shadowOffset = CGSize(width: 0, height: 10)
+        menuButtonBlur.layer.masksToBounds = false
+        view.addSubview(menuButtonBlur)
+
+        NSLayoutConstraint.activate([
+            menuButtonBlur.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -14),
+            menuButtonBlur.centerYAnchor.constraint(equalTo: floatingToolbar.centerYAnchor),
+            menuButtonBlur.widthAnchor.constraint(equalToConstant: 40),
+            menuButtonBlur.heightAnchor.constraint(equalToConstant: 40)
+        ])
+
+        menuButton.translatesAutoresizingMaskIntoConstraints = false
+        menuButton.setImage(UIImage(systemName: "line.3.horizontal"), for: .normal)
+        menuButton.tintColor = .white
+        menuButton.addTarget(self, action: #selector(openSettings), for: .touchUpInside)
+        menuButtonBlur.contentView.addSubview(menuButton)
+
+        NSLayoutConstraint.activate([
+            menuButton.centerXAnchor.constraint(equalTo: menuButtonBlur.contentView.centerXAnchor),
+            menuButton.centerYAnchor.constraint(equalTo: menuButtonBlur.contentView.centerYAnchor)
+        ])
+    }
+
+    // MARK: - Settings overlay UI
+
+    private func configureSettingsOverlay() {
+        settingsOverlay.translatesAutoresizingMaskIntoConstraints = false
+        settingsOverlay.backgroundColor = UIColor.black.withAlphaComponent(0.35)
+        settingsOverlay.isHidden = true
+        settingsOverlay.alpha = 0
+        view.addSubview(settingsOverlay)
+
+        NSLayoutConstraint.activate([
+            settingsOverlay.topAnchor.constraint(equalTo: view.topAnchor),
+            settingsOverlay.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            settingsOverlay.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            settingsOverlay.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+
+        // ✅ Tap outside to close (delegate filters inside-card taps)
+        settingsOverlay.addGestureRecognizer(overlayDismissTap)
+
+        // Card
+        settingsCardBlur.translatesAutoresizingMaskIntoConstraints = false
+        settingsCardBlur.layer.cornerRadius = 16
+        settingsCardBlur.clipsToBounds = true
+        settingsOverlay.addSubview(settingsCardBlur)
+
+        NSLayoutConstraint.activate([
+            settingsCardBlur.trailingAnchor.constraint(equalTo: settingsOverlay.trailingAnchor, constant: -14),
+            settingsCardBlur.topAnchor.constraint(equalTo: floatingToolbar.bottomAnchor, constant: 10),
+            settingsCardBlur.widthAnchor.constraint(equalToConstant: 290)
+        ])
+
+        // Content inside card
+        let content = settingsCardBlur.contentView
+
+        let title = UILabel()
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.text = "Page Turn"
+        title.font = .systemFont(ofSize: 16, weight: .semibold)
+        title.textColor = .white
+
+        let gestureLabel = UILabel()
+        gestureLabel.translatesAutoresizingMaskIntoConstraints = false
+        gestureLabel.text = "Gesture"
+        gestureLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        gestureLabel.textColor = UIColor.white.withAlphaComponent(0.9)
+
+        gesturePicker.translatesAutoresizingMaskIntoConstraints = false
+        gesturePicker.dataSource = self
+        gesturePicker.delegate = self
+
+        let confLabel = UILabel()
+        confLabel.translatesAutoresizingMaskIntoConstraints = false
+        confLabel.text = "Confidence"
+        confLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        confLabel.textColor = UIColor.white.withAlphaComponent(0.9)
+
+        confidenceSlider.translatesAutoresizingMaskIntoConstraints = false
+        confidenceSlider.minimumValue = 0
+        confidenceSlider.maximumValue = 100
+        confidenceSlider.value = Float(confidence)
+        confidenceSlider.addTarget(self, action: #selector(confidenceChanged(_:)), for: .valueChanged)
+
+        confidenceValueLabel.translatesAutoresizingMaskIntoConstraints = false
+        confidenceValueLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        confidenceValueLabel.textColor = .white
+        confidenceValueLabel.textAlignment = .right
+        confidenceValueLabel.text = "\(confidence)"
+
+        calibrateButton.translatesAutoresizingMaskIntoConstraints = false
+        calibrateButton.setTitle("Calibrate Tilt", for: .normal)
+        calibrateButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
+        calibrateButton.tintColor = .white
+        calibrateButton.backgroundColor = UIColor.white.withAlphaComponent(0.12)
+        calibrateButton.layer.cornerRadius = 10
+        calibrateButton.addTarget(self, action: #selector(calibrateTiltPressed), for: .touchUpInside)
+
+        doneButton.translatesAutoresizingMaskIntoConstraints = false
+        doneButton.setTitle("Done", for: .normal)
+        doneButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
+        doneButton.tintColor = .white
+        doneButton.backgroundColor = UIColor.white.withAlphaComponent(0.12)
+        doneButton.layer.cornerRadius = 10
+        doneButton.addTarget(self, action: #selector(closeSettings), for: .touchUpInside)
+
+        content.addSubview(title)
+        content.addSubview(gestureLabel)
+        content.addSubview(gesturePicker)
+        content.addSubview(confLabel)
+        content.addSubview(confidenceSlider)
+        content.addSubview(confidenceValueLabel)
+        content.addSubview(calibrateButton)
+        content.addSubview(doneButton)
+
+        NSLayoutConstraint.activate([
+            title.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            title.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            title.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+
+            gestureLabel.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 10),
+            gestureLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            gestureLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+
+            gesturePicker.topAnchor.constraint(equalTo: gestureLabel.bottomAnchor, constant: 6),
+            gesturePicker.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 6),
+            gesturePicker.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -6),
+            gesturePicker.heightAnchor.constraint(equalToConstant: 120),
+
+            confLabel.topAnchor.constraint(equalTo: gesturePicker.bottomAnchor, constant: 8),
+            confLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+
+            confidenceValueLabel.centerYAnchor.constraint(equalTo: confLabel.centerYAnchor),
+            confidenceValueLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            confidenceValueLabel.widthAnchor.constraint(equalToConstant: 44),
+
+            confidenceSlider.topAnchor.constraint(equalTo: confLabel.bottomAnchor, constant: 8),
+            confidenceSlider.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            confidenceSlider.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+
+            calibrateButton.topAnchor.constraint(equalTo: confidenceSlider.bottomAnchor, constant: 12),
+            calibrateButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            calibrateButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            calibrateButton.heightAnchor.constraint(equalToConstant: 40),
+
+            doneButton.topAnchor.constraint(equalTo: calibrateButton.bottomAnchor, constant: 10),
+            doneButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            doneButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            doneButton.heightAnchor.constraint(equalToConstant: 40),
+            doneButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12)
+        ])
+
+        // Set picker to current selection
+        if let idx = PageTurnGesture.allCases.firstIndex(of: selectedGesture) {
+            gesturePicker.selectRow(idx, inComponent: 0, animated: false)
+        }
+
+        updateCalibrateButtonVisibility()
+    }
+
+    private func updateCalibrateButtonVisibility() {
+        // Show only when tilt is selected (you asked specifically for headroll calibration)
+        calibrateButton.isHidden = !selectedGesture.isTilt
+    }
+
+    @objc private func openSettings() {
+        setChromeHidden(false, animated: true)
+        scheduleChromeHideIfNeeded()
+
+        // refresh UI from stored settings
+        confidenceSlider.value = Float(confidence)
+        confidenceValueLabel.text = "\(confidence)"
+        if let idx = PageTurnGesture.allCases.firstIndex(of: selectedGesture) {
+            gesturePicker.selectRow(idx, inComponent: 0, animated: false)
+        }
+        updateCalibrateButtonVisibility()
+
+        settingsOverlay.isHidden = false
+        settingsOverlay.alpha = 0
+        UIView.animate(withDuration: 0.18) { self.settingsOverlay.alpha = 1 }
+    }
+
+    @objc private func closeSettings() {
+        UIView.animate(withDuration: 0.18, animations: {
+            self.settingsOverlay.alpha = 0
+        }, completion: { _ in
+            self.settingsOverlay.isHidden = true
+            self.recalibrateTiltIfNeeded()
+            self.scheduleChromeHideIfNeeded()
+        })
+    }
+
+    @objc private func calibrateTiltPressed() {
+        faceDriver.calibrateRollBaseline()
+
+        // Quick visual feedback
+        UIView.animate(withDuration: 0.08, animations: {
+            self.calibrateButton.transform = CGAffineTransform(scaleX: 0.98, y: 0.98)
+        }, completion: { _ in
+            UIView.animate(withDuration: 0.12) {
+                self.calibrateButton.transform = .identity
+            }
+        })
+    }
+
+    @objc private func confidenceChanged(_ sender: UISlider) {
+        let v = Int(sender.value.rounded())
+        confidence = v
+        confidenceValueLabel.text = "\(v)"
+    }
+
     // MARK: - PDF
 
     private func loadPDF() {
@@ -206,7 +521,6 @@ final class PDFViewerViewController: UIViewController, UIGestureRecognizerDelega
         applyZoomLimits()
     }
 
-    // Prevent infinite zoom-out: min zoom = fit-to-screen
     private func applyZoomLimits() {
         let fit = pdfView.scaleFactorForSizeToFit
         pdfView.minScaleFactor = fit
@@ -217,58 +531,56 @@ final class PDFViewerViewController: UIViewController, UIGestureRecognizerDelega
     // MARK: - Tap zones + Chrome reveal
 
     @objc private func handleTapZones(_ gr: UITapGestureRecognizer) {
-        let p = gr.location(in: view) // ✅ use root view coordinates
+        // If settings are open, ignore taps here (overlay handles its own taps)
+        if !settingsOverlay.isHidden { return }
+
+        let p = gr.location(in: view)
         let w = view.bounds.width
         let h = view.bounds.height
         guard w > 0, h > 0 else { return }
 
-        // Any interaction counts as activity
-        // (so if chrome is already visible, it stays up a bit longer)
-        if !chromeHidden {
-            scheduleChromeHideIfNeeded()
-        }
+        // Zone definitions
+        let zoneWidth = w * 0.15          // 15% width
+        let zoneTopY  = h * 0.25          // bottom 75% => starts at 25% from top
 
-        // 🔝 Top reveal zone (tap near top to show controls)
-        let topRevealHeight = h * 0.22
-        if p.y < topRevealHeight {
-            setChromeHidden(false, animated: true)
+        let inBottomBand = p.y >= zoneTopY
+        let inLeftZone   = inBottomBand && p.x <= zoneWidth
+        let inRightZone  = inBottomBand && p.x >= (w - zoneWidth)
+
+        if inLeftZone {
+            // Back
+            pdfView.goToPreviousPage(nil)
             scheduleChromeHideIfNeeded()
             return
         }
 
-        // Page turn zones (only apply if tap is within the PDF view area)
-        // Translate tap point into pdfView space
-        let pInPDF = gr.location(in: pdfView)
-        let pdfW = pdfView.bounds.width
-        let pdfH = pdfView.bounds.height
-        guard pdfW > 0, pdfH > 0 else { return }
-
-        let left = pdfW / 3.0
-        let right = 2.0 * pdfW / 3.0
-
-        if pInPDF.x < left {
-            pdfView.goToPreviousPage(nil)
-            scheduleChromeHideIfNeeded()
-        } else if pInPDF.x > right {
+        if inRightZone {
+            // Next
             pdfView.goToNextPage(nil)
             scheduleChromeHideIfNeeded()
-        } else {
-            toggleChrome()
+            return
         }
+
+        // Remaining area: show chrome (toolbar + hamburger + chevron)
+        setChromeHidden(false, animated: true)
+        scheduleChromeHideIfNeeded()
     }
 
-    // ✅ Make our tap recognizer work alongside PDFKit’s internal recognizers
+
+    // MARK: - Gesture recognizer delegate
+
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
         true
     }
 
-    // ✅ Give our tap priority when PDFKit has competing taps
-    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
-                           shouldRequireFailureOf otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-        // If PDFKit has internal tap recognizers, we still want ours to fire.
-        // Returning false means we don't require others to fail.
-        return false
+    /// ✅ Key fix: only dismiss settings when tapping OUTSIDE the card
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        if gestureRecognizer === overlayDismissTap {
+            let p = touch.location(in: settingsOverlay)
+            return !settingsCardBlur.frame.contains(p) // allow dismiss only outside card
+        }
+        return true
     }
 
     // MARK: - Chrome auto-hide
@@ -288,9 +600,10 @@ final class PDFViewerViewController: UIViewController, UIGestureRecognizerDelega
     private func setChromeHidden(_ hidden: Bool, animated: Bool) {
         chromeHidden = hidden
         let apply = {
-            self.navigationController?.setNavigationBarHidden(true, animated: false) // keep real nav hidden
+            self.navigationController?.setNavigationBarHidden(true, animated: false)
             self.floatingToolbar.alpha = hidden ? 0 : 1
             self.backButtonBlur.alpha = hidden ? 0 : 1
+            self.menuButtonBlur.alpha = hidden ? 0 : 1
         }
         if animated {
             UIView.animate(withDuration: 0.2, animations: apply)
@@ -315,6 +628,32 @@ final class PDFViewerViewController: UIViewController, UIGestureRecognizerDelega
         if doc.write(to: pdfURL) {
             annotationsDirty = false
         }
+    }
+}
+
+// MARK: - UIPickerView
+
+extension PDFViewerViewController: UIPickerViewDataSource, UIPickerViewDelegate {
+    func numberOfComponents(in pickerView: UIPickerView) -> Int { 1 }
+    func pickerView(_ pickerView: UIPickerView, numberOfRowsInComponent component: Int) -> Int {
+        PageTurnGesture.allCases.count
+    }
+
+    func pickerView(_ pickerView: UIPickerView, rowHeightForComponent component: Int) -> CGFloat {
+        34
+    }
+
+    func pickerView(_ pickerView: UIPickerView,
+                    attributedTitleForRow row: Int,
+                    forComponent component: Int) -> NSAttributedString? {
+        let g = PageTurnGesture.allCases[row]
+        return NSAttributedString(string: g.displayName, attributes: [
+            .foregroundColor: UIColor.white
+        ])
+    }
+
+    func pickerView(_ pickerView: UIPickerView, didSelectRow row: Int, inComponent component: Int) {
+        selectedGesture = PageTurnGesture.allCases[row]
     }
 }
 
